@@ -226,7 +226,7 @@ pub struct AppPreferences {
     #[serde(default)]
     pub http_server_token: Option<String>, // Persisted auth token (generated once)
     #[serde(default)]
-    pub http_server_bind_host: Option<String>, // Explicit bind host (localhost or specific IP)
+    pub http_server_bind_host: Option<String>, // Explicit bind host (localhost, specific IP, or Tailscale MagicDNS hostname)
     #[serde(default)]
     pub http_server_localhost_only: bool, // Legacy fallback when no explicit bind host is set
     #[serde(default = "default_http_server_token_required")]
@@ -3409,7 +3409,7 @@ fn print_cli_help() {
     println!("Options:");
     println!("  --headless          Run without GUI (HTTP server only)");
     println!(
-        "  --host <addr>       Bind to an IP address or localhost (default: 0.0.0.0 in headless)"
+        "  --host <addr>       Bind to an IP address, hostname, or localhost (default: 0.0.0.0 in headless)"
     );
     println!("  --port <port>       HTTP server port (overrides saved preference)");
     println!("  --token <token>     Use specific auth token (not persisted)");

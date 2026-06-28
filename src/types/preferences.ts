@@ -1068,7 +1068,7 @@ export interface AppPreferences {
   http_server_enabled: boolean // Whether HTTP server is enabled
   http_server_port: number // HTTP server port (default 3456)
   http_server_token: string | null // Auth token for HTTP/WS access
-  http_server_bind_host: string | null // Explicit bind host for HTTP server, null = use legacy fallback
+  http_server_bind_host: string | null // Explicit bind host for HTTP server (IP, localhost, or Tailscale MagicDNS hostname), null = use legacy fallback
   http_server_auto_start: boolean // Auto-start HTTP server on launch
   http_server_localhost_only: boolean // Legacy localhost-only fallback when no bind host is set
   http_server_token_required: boolean // Require token for web access (default true)

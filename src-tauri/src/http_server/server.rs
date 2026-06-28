@@ -10,7 +10,7 @@ use if_addrs::get_if_addrs;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 use tokio::sync::Mutex;
@@ -199,7 +199,7 @@ pub async fn start_server(
     bind_host: String,
     token_required: bool,
 ) -> Result<HttpServerHandle, String> {
-    let bind_ip = parse_bind_ip(&bind_host)?;
+    let bind_ip = resolve_bind_host_to_ip(&bind_host)?;
     let localhost_only = bind_ip.is_loopback();
 
     // Resolve the dist directory at runtime for static file serving
@@ -239,7 +239,10 @@ pub async fn start_server(
         .local_addr()
         .map_err(|e| format!("Failed to get local address: {e}"))?;
 
-    let url = format_http_url(&display_host_for_bind_ip(bind_ip), local_addr.port());
+    let url = format_http_url(
+        &display_host_for_bind(&bind_host, bind_ip),
+        local_addr.port(),
+    );
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let bind_host_for_log = bind_host.clone();
@@ -1154,30 +1157,41 @@ async fn static_handler(uri: Uri, State(state): State<AppState>) -> Response {
         .unwrap()
 }
 
-fn parse_bind_ip(host: &str) -> Result<IpAddr, String> {
+pub(crate) fn validate_bind_host(host: &str) -> Result<String, String> {
     let trimmed = host.trim();
     if trimmed.is_empty() {
         return Err("Bind address cannot be empty".to_string());
     }
 
     if trimmed.eq_ignore_ascii_case("localhost") {
-        return Ok(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        return Ok("localhost".to_string());
     }
 
-    trimmed
-        .parse::<IpAddr>()
-        .map_err(|_| format!("Invalid bind address '{trimmed}'. Use an IP address or 'localhost'"))
-}
-
-pub(crate) fn validate_bind_host(host: &str) -> Result<String, String> {
-    let trimmed = host.trim();
-    parse_bind_ip(trimmed)?;
-
-    if trimmed.eq_ignore_ascii_case("localhost") {
-        Ok("localhost".to_string())
-    } else {
-        Ok(trimmed.to_string())
+    // IP literals are accepted as-is.
+    if trimmed.parse::<IpAddr>().is_ok() {
+        return Ok(trimmed.to_string());
     }
+
+    // Hostnames must resolve to at least one Tailscale IP address.
+    let addrs: Vec<std::net::SocketAddr> = (trimmed, 0)
+        .to_socket_addrs()
+        .map_err(|e| format!("Could not resolve hostname '{trimmed}': {e}"))?
+        .collect();
+
+    if addrs.is_empty() {
+        return Err(format!(
+            "Hostname '{trimmed}' did not resolve to any addresses"
+        ));
+    }
+
+    let has_tailscale = addrs.iter().any(|sa| is_tailscale_ip(sa.ip()));
+    if !has_tailscale {
+        return Err(format!(
+            "Hostname '{trimmed}' must resolve to a Tailscale IP address (100.64/10 or fd7a:115c:a1e0::/48)"
+        ));
+    }
+
+    Ok(trimmed.to_string())
 }
 
 fn display_host_for_bind_ip(bind_ip: IpAddr) -> String {
@@ -1255,6 +1269,16 @@ pub fn list_bind_host_options() -> Vec<BindHostOption> {
             label: "All interfaces".to_string(),
         },
     ];
+
+    if let Some(dns_name) = detect_tailscale_dns_name() {
+        if seen.insert(dns_name.clone()) {
+            options.push(BindHostOption {
+                host: dns_name.clone(),
+                label: format!("Tailscale MagicDNS ({dns_name})"),
+            });
+        }
+    }
+
     let mut detected = Vec::new();
 
     if let Ok(interfaces) = get_if_addrs() {
@@ -1317,6 +1341,100 @@ fn is_tailscale_ipv6(ip: Ipv6Addr) -> bool {
     segments[0] == 0xfd7a && segments[1] == 0x115c && segments[2] == 0xa1e0
 }
 
+fn is_tailscale_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_tailscale_ipv4(v4),
+        IpAddr::V6(v6) => is_tailscale_ipv6(v6),
+    }
+}
+
+/// Pick a single IP to bind to from a list of resolved addresses.
+/// Prefers Tailscale IPv4, then Tailscale IPv6, then private IPv4,
+/// then any IPv4, then any IPv6.
+fn pick_bind_ip(ips: &[IpAddr]) -> Option<IpAddr> {
+    ips.iter()
+        .copied()
+        .find(|ip| matches!(ip, IpAddr::V4(v4) if is_tailscale_ipv4(*v4)))
+        .or_else(|| {
+            ips.iter()
+                .copied()
+                .find(|ip| matches!(ip, IpAddr::V6(v6) if is_tailscale_ipv6(*v6)))
+        })
+        .or_else(|| {
+            ips.iter()
+                .copied()
+                .find(|ip| matches!(ip, IpAddr::V4(v4) if v4.is_private()))
+        })
+        .or_else(|| ips.iter().copied().find(|ip| matches!(ip, IpAddr::V4(_))))
+        .or_else(|| ips.iter().copied().find(|ip| matches!(ip, IpAddr::V6(_))))
+}
+
+/// Resolve a bind host string to an IP address.
+/// Accepts "localhost", IP literals, and DNS hostnames.
+/// For hostnames, performs a DNS lookup and picks the best resolved IP.
+fn resolve_bind_host_to_ip(host: &str) -> Result<IpAddr, String> {
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return Err("Bind address cannot be empty".to_string());
+    }
+
+    if trimmed.eq_ignore_ascii_case("localhost") {
+        return Ok(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        return Ok(ip);
+    }
+
+    let addrs: Vec<std::net::SocketAddr> = (trimmed, 0)
+        .to_socket_addrs()
+        .map_err(|e| format!("Could not resolve hostname '{trimmed}': {e}"))?
+        .collect();
+
+    let ips: Vec<IpAddr> = addrs.into_iter().map(|sa| sa.ip()).collect();
+    pick_bind_ip(&ips)
+        .ok_or_else(|| format!("Hostname '{trimmed}' did not resolve to a usable IP address"))
+}
+
+/// Detect the local Tailscale MagicDNS hostname from `tailscale status --json`.
+fn detect_tailscale_dns_name() -> Option<String> {
+    let output = crate::platform::silent_command("tailscale")
+        .args(["status", "--json"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let dns_name = json
+        .get("Self")?
+        .get("DNSName")?
+        .as_str()?
+        .trim_end_matches('.')
+        .to_string();
+
+    if dns_name.is_empty() {
+        None
+    } else {
+        Some(dns_name)
+    }
+}
+
+/// Choose the host string to display in the access URL.
+/// If the configured bind host is itself a hostname, preserve it in the URL.
+fn display_host_for_bind(bind_host: &str, bind_ip: IpAddr) -> String {
+    let trimmed = bind_host.trim();
+    if trimmed.eq_ignore_ascii_case("localhost") {
+        return "localhost".to_string();
+    }
+    if trimmed.parse::<IpAddr>().is_ok() {
+        return display_host_for_bind_ip(bind_ip);
+    }
+    trimmed.to_string()
+}
+
 /// Get current server status. Called from dispatch.
 pub async fn get_server_status(app: AppHandle) -> ServerStatus {
     match app.try_state::<Arc<Mutex<Option<HttpServerHandle>>>>() {
@@ -1355,35 +1473,90 @@ pub async fn get_server_status(app: AppHandle) -> ServerStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        bind_host_option_label, bind_host_option_rank, display_host_for_bind_ip,
-        display_ip_for_bind_ip_with_candidates, format_http_url, is_tailscale_ipv4, parse_bind_ip,
-        path_is_in_known_roots, validate_bind_host,
+        bind_host_option_label, bind_host_option_rank, display_host_for_bind,
+        display_host_for_bind_ip, display_ip_for_bind_ip_with_candidates, format_http_url,
+        is_tailscale_ip, is_tailscale_ipv4, path_is_in_known_roots, pick_bind_ip,
+        resolve_bind_host_to_ip, validate_bind_host,
     };
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     #[test]
-    fn parse_bind_ip_accepts_localhost_and_ip_literals() {
+    fn resolve_bind_host_accepts_localhost_and_ip_literals() {
         assert_eq!(
-            parse_bind_ip("localhost").unwrap(),
+            resolve_bind_host_to_ip("localhost").unwrap(),
             IpAddr::V4(Ipv4Addr::LOCALHOST)
         );
         assert_eq!(
-            parse_bind_ip("100.64.0.1").unwrap(),
+            resolve_bind_host_to_ip("100.64.0.1").unwrap(),
             IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))
         );
         assert_eq!(
-            parse_bind_ip("::1").unwrap(),
+            resolve_bind_host_to_ip("::1").unwrap(),
             IpAddr::V6(Ipv6Addr::LOCALHOST)
         );
     }
 
     #[test]
-    fn parse_bind_ip_rejects_invalid_values() {
-        let error = parse_bind_ip("tailscale").unwrap_err();
-        assert!(error.contains("Invalid bind address"));
+    fn resolve_bind_host_rejects_invalid_values() {
+        let error = resolve_bind_host_to_ip("").unwrap_err();
+        assert!(error.contains("cannot be empty"));
 
-        let empty_error = parse_bind_ip("").unwrap_err();
-        assert!(empty_error.contains("cannot be empty"));
+        let invalid_ip_error = resolve_bind_host_to_ip("999.999.999.999").unwrap_err();
+        assert!(
+            invalid_ip_error.contains("Could not resolve hostname")
+                || invalid_ip_error.contains("invalid socket address")
+        );
+    }
+
+    #[test]
+    fn pick_bind_ip_prefers_tailscale_ipv4_then_tailscale_ipv6() {
+        let tailscale_v4 = IpAddr::V4(Ipv4Addr::new(100, 110, 76, 47));
+        let tailscale_v6 = IpAddr::V6("fd7a:115c:a1e0::1".parse::<Ipv6Addr>().unwrap());
+        let private_v4 = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
+
+        assert_eq!(
+            pick_bind_ip(&[private_v4, tailscale_v6]),
+            Some(tailscale_v6)
+        );
+        assert_eq!(
+            pick_bind_ip(&[tailscale_v6, tailscale_v4]),
+            Some(tailscale_v4)
+        );
+        assert_eq!(
+            pick_bind_ip(&[private_v4, tailscale_v4]),
+            Some(tailscale_v4)
+        );
+    }
+
+    #[test]
+    fn is_tailscale_ip_matches_v4_and_v6_ranges() {
+        assert!(is_tailscale_ip(IpAddr::V4(Ipv4Addr::new(100, 110, 76, 47))));
+        assert!(!is_tailscale_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+        assert!(is_tailscale_ip(IpAddr::V6(
+            "fd7a:115c:a1e0::1".parse::<Ipv6Addr>().unwrap()
+        )));
+        assert!(!is_tailscale_ip(IpAddr::V6(
+            "fe80::1".parse::<Ipv6Addr>().unwrap()
+        )));
+    }
+
+    #[test]
+    fn display_host_for_bind_preserves_hostname() {
+        assert_eq!(
+            display_host_for_bind(
+                "myhost.tailnet.ts.net",
+                IpAddr::V4(Ipv4Addr::new(100, 110, 76, 47))
+            ),
+            "myhost.tailnet.ts.net"
+        );
+        assert_eq!(
+            display_host_for_bind("localhost", IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+            "localhost"
+        );
+        assert_eq!(
+            display_host_for_bind("100.110.76.47", IpAddr::V4(Ipv4Addr::new(100, 110, 76, 47))),
+            "100.110.76.47"
+        );
     }
 
     #[test]
@@ -1409,6 +1582,14 @@ mod tests {
             validate_bind_host(" 100.110.76.47 ").unwrap(),
             "100.110.76.47"
         );
+    }
+
+    #[test]
+    fn validate_bind_host_rejects_empty_and_invalid_hostnames() {
+        assert!(validate_bind_host("").is_err());
+        assert!(validate_bind_host("   ").is_err());
+        // A hostname that does not resolve should be rejected.
+        assert!(validate_bind_host("this-host-definitely-does-not-exist.invalid").is_err());
     }
 
     #[test]

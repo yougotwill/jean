@@ -35,7 +35,7 @@ import { SettingsSection } from '../SettingsSection'
 const LOOPBACK_BIND_HOSTS = new Set(['localhost', '127.0.0.1', '::1'])
 const WILDCARD_BIND_HOSTS = new Set(['0.0.0.0', '::'])
 
-function getConfiguredBindHost(
+export function getConfiguredBindHost(
   preferences: AppPreferences | undefined
 ): string {
   const explicit = preferences?.http_server_bind_host?.trim()
@@ -45,11 +45,11 @@ function getConfiguredBindHost(
     : '0.0.0.0'
 }
 
-function isLoopbackBindHost(host: string | null | undefined): boolean {
+export function isLoopbackBindHost(host: string | null | undefined): boolean {
   return host != null && LOOPBACK_BIND_HOSTS.has(host.trim().toLowerCase())
 }
 
-function isWildcardBindHost(host: string | null | undefined): boolean {
+export function isWildcardBindHost(host: string | null | undefined): boolean {
   return host != null && WILDCARD_BIND_HOSTS.has(host.trim().toLowerCase())
 }
 
@@ -63,7 +63,7 @@ function getUrlHostname(url: string | null | undefined): string | null {
   }
 }
 
-function hasUsableBoundUrl(url: string | null | undefined): boolean {
+export function hasUsableBoundUrl(url: string | null | undefined): boolean {
   const hostname = getUrlHostname(url)
   return hostname != null && !isWildcardBindHost(hostname)
 }
@@ -422,7 +422,7 @@ export const WebAccessPane: React.FC = () => {
 
           <InlineField
             label="Bind address"
-            description="Use localhost, 0.0.0.0, or a specific IP such as your Tailscale address"
+            description="Use localhost, 0.0.0.0, a specific IP, or your Tailscale MagicDNS hostname"
           >
             <div className="flex flex-col gap-2">
               <Input
@@ -432,7 +432,7 @@ export const WebAccessPane: React.FC = () => {
                 onChange={e => setBindHostInput(e.target.value)}
                 onBlur={() => void handleBindHostBlur()}
                 disabled={isToggling}
-                placeholder="127.0.0.1"
+                placeholder="127.0.0.1 or myhost.tailnet.ts.net"
               />
               {bindHostOptions.length > 0 && (
                 <Select
